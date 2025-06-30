@@ -1,0 +1,2 @@
+svn==1.0.1  # Python SVN bindings
+click==8.1.7  # 命令行接口工具 
