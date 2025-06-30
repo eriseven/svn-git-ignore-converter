@@ -8,6 +8,7 @@ import fnmatch
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import re
 
 
 def get_svn_ignore(path: str) -> Optional[str]:
@@ -32,13 +33,52 @@ def get_svn_ignore(path: str) -> Optional[str]:
         return None
 
 
+def get_all_svn_ignores(base_path: str) -> dict:
+    """
+    一次性获取所有目录的svn:ignore属性，返回{绝对路径: 属性内容}字典，适配"路径 - 忽略项"格式
+    """
+    ignores = {}
+    try:
+        result = subprocess.run(
+            ['svn', 'propget', 'svn:ignore', '-R', base_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        lines = result.stdout.splitlines()
+        current_dir = None
+        current_ignores = []
+        dir_line_pattern = re.compile(r'^(.*) - (.+)$')
+        for line in lines:
+            if not line.strip():
+                continue
+            m = dir_line_pattern.match(line)
+            if m:
+                # 保存上一个目录
+                if current_dir and current_ignores:
+                    ignores[current_dir] = '\n'.join(current_ignores).strip()
+                # 新目录
+                current_dir = m.group(1).strip()
+                abs_dir = os.path.abspath(current_dir)
+                current_dir = abs_dir
+                current_ignores = [m.group(2).strip()]
+            else:
+                if current_dir is not None:
+                    current_ignores.append(line.strip())
+        # 保存最后一个目录
+        if current_dir and current_ignores:
+            ignores[current_dir] = '\n'.join(current_ignores).strip()
+    except subprocess.CalledProcessError:
+        pass
+    return ignores
+
+
 def process_directory(path: str, recursive: bool = False, max_depth: int = 0, threads: int = 4) -> List[tuple[str, str]]:
     """
-    处理目录，获取所有svn:ignore配置，支持递归深度限制和多线程并行
+    使用批量获取的方式，极大提升收集效率
     """
     results = []
     base_path = os.path.abspath(path)
-
     if not recursive:
         ignore_config = get_svn_ignore(path)
         if ignore_config:
@@ -49,47 +89,46 @@ def process_directory(path: str, recursive: bool = False, max_depth: int = 0, th
 
     # 统计收集目录耗时
     t0 = time.time()
-    dirs_to_process = []
-    for root, dirs, _ in os.walk(path, topdown=True):
-        if '.svn' in dirs:
-            dirs.remove('.svn')
-        rel_path = os.path.relpath(root, base_path)
+    all_ignores = get_all_svn_ignores(path)
+    t1 = time.time()
+    click.echo(f"共需处理 {len(all_ignores)} 个目录，收集目录耗时：{t1-t0:.2f} 秒")
+
+    # 统计递归处理耗时
+    t2 = time.time()
+    # 剪枝：跳过被父目录ignore的目录
+    # 先按路径深度排序，保证父目录先处理
+    sorted_dirs = sorted(all_ignores.keys(), key=lambda d: d.count(os.sep))
+    for idx, d in enumerate(sorted_dirs, 1):
+        rel_path = os.path.relpath(d, base_path)
+        rel_path = '.' if rel_path == '.' else rel_path
+        # 计算递归深度
         if rel_path == '.':
             depth = 0
         else:
             depth = rel_path.count(os.sep) + 1
         if max_depth > 0 and depth > max_depth:
-            dirs.clear()
             continue
-        dirs_to_process.append(root)
-        ignore_config = get_svn_ignore(root)
-        ignore_patterns = [p.strip() for p in (ignore_config or '').splitlines() if p.strip()]
-        if ignore_patterns:
-            dirs[:] = [d for d in dirs if not any(fnmatch.fnmatch(d, pattern) for pattern in ignore_patterns)]
-    t1 = time.time()
-    click.echo(f"共需处理 {len(dirs_to_process)} 个目录，收集目录耗时：{t1-t0:.2f} 秒")
-
-    # 统计递归处理耗时
-    t2 = time.time()
-    if threads > 10:
-        threads = 10
-
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        future_to_path = {executor.submit(get_svn_ignore, d): d for d in dirs_to_process}
-        for idx, future in enumerate(as_completed(future_to_path), 1):
-            d = future_to_path[future]
-            rel_path = os.path.relpath(d, base_path)
-            rel_path = '.' if rel_path == '.' else rel_path
-            click.echo(f"[{idx}/{len(dirs_to_process)}] 处理: {rel_path}")
-            try:
-                ignore_config = future.result()
-                if ignore_config:
-                    results.append((rel_path, ignore_config))
-            except Exception as e:
-                click.echo(f"警告: 处理 {rel_path} 时出错: {e}", err=True)
+        # 检查是否被父目录ignore
+        parent = os.path.dirname(d)
+        skip = False
+        while parent and parent != d and parent.startswith(base_path):
+            if parent in all_ignores:
+                parent_patterns = [p.strip() for p in all_ignores[parent].splitlines() if p.strip()]
+                if any(fnmatch.fnmatch(os.path.basename(d), pat) for pat in parent_patterns):
+                    skip = True
+                    break
+            new_parent = os.path.dirname(parent)
+            if new_parent == parent:
+                break
+            parent = new_parent
+        if skip:
+            continue
+        click.echo(f"[{idx}/{len(sorted_dirs)}] 处理: {rel_path}")
+        ignore_config = all_ignores[d]
+        if ignore_config:
+            results.append((rel_path, ignore_config))
     t3 = time.time()
     click.echo(f"递归处理耗时：{t3-t2:.2f} 秒")
-
     return results
 
 
